@@ -2,7 +2,7 @@ mod outline_panel_settings;
 
 use anyhow::Context as _;
 use collections::{BTreeSet, HashMap, HashSet, hash_map};
-use db::kvp::KEY_VALUE_STORE;
+use db::kvp::KeyValueStore;
 use editor::{
     AnchorRangeExt, Bias, DisplayPoint, Editor, EditorEvent, ExcerptId, ExcerptRange,
     MultiBufferSnapshot, RangeToAnchorExt, SelectionEffects,
@@ -11,6 +11,7 @@ use editor::{
     scroll::{Autoscroll, ScrollAnchor},
 };
 use file_icons::FileIcons;
+
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncWindowContext, Bounds, ClipboardItem, Context,
@@ -22,6 +23,7 @@ use gpui::{
     uniform_list,
 };
 use itertools::Itertools;
+use language::language_settings::language_settings;
 use language::{Anchor, BufferId, BufferSnapshot, OffsetRangeExt, OutlineItem};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use std::{
@@ -91,6 +93,8 @@ actions!(
         ToggleActiveEditorPin,
         /// Unfolds the selected directory.
         UnfoldDirectory,
+        /// Toggles the outline panel.
+        Toggle,
         /// Toggles focus on the outline panel.
         ToggleFocus,
     ]
@@ -104,7 +108,6 @@ type HighlightStyleData = Arc<OnceLock<Vec<(Range<usize>, HighlightStyle)>>>;
 
 pub struct OutlinePanel {
     fs: Arc<dyn Fs>,
-    width: Option<Pixels>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     active: bool,
@@ -126,7 +129,7 @@ pub struct OutlinePanel {
     fs_entries_update_task: Task<()>,
     cached_entries_update_task: Task<()>,
     reveal_selection_task: Task<anyhow::Result<()>>,
-    outline_fetch_tasks: HashMap<(BufferId, ExcerptId), Task<()>>,
+    outline_fetch_tasks: HashMap<BufferId, Task<()>>,
     excerpts: HashMap<BufferId, HashMap<ExcerptId, Excerpt>>,
     cached_entries: Vec<CachedEntry>,
     filter_editor: Entity<Editor>,
@@ -659,7 +662,6 @@ pub enum Event {
 
 #[derive(Serialize, Deserialize)]
 struct SerializedOutlinePanel {
-    width: Option<Pixels>,
     active: Option<bool>,
 }
 
@@ -667,6 +669,11 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<OutlinePanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &Toggle, window, cx| {
+            if !workspace.toggle_panel_focus::<OutlinePanel>(window, cx) {
+                workspace.close_panel::<OutlinePanel>(window, cx);
+            }
         });
     })
     .detach();
@@ -684,34 +691,31 @@ impl OutlinePanel {
             .ok()
             .flatten()
         {
-            Some(serialization_key) => cx
-                .background_spawn(async move { KEY_VALUE_STORE.read_kvp(&serialization_key) })
-                .await
-                .context("loading outline panel")
-                .log_err()
-                .flatten()
-                .map(|panel| serde_json::from_str::<SerializedOutlinePanel>(&panel))
-                .transpose()
-                .log_err()
-                .flatten(),
+            Some(serialization_key) => {
+                let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
+                cx.background_spawn(async move { kvp.read_kvp(&serialization_key) })
+                    .await
+                    .context("loading outline panel")
+                    .log_err()
+                    .flatten()
+                    .map(|panel| serde_json::from_str::<SerializedOutlinePanel>(&panel))
+                    .transpose()
+                    .log_err()
+                    .flatten()
+            }
             None => None,
         };
 
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            let panel = Self::new(workspace, window, cx);
-            if let Some(serialized_panel) = serialized_panel {
-                panel.update(cx, |panel, cx| {
-                    panel.width = serialized_panel.width.map(|px| px.round());
-                    panel.active = serialized_panel.active.unwrap_or(false);
-                    cx.notify();
-                });
-            }
+            let panel = Self::new(workspace, serialized_panel.as_ref(), window, cx);
+            panel.update(cx, |_, cx| cx.notify());
             panel
         })
     }
 
     fn new(
         workspace: &mut Workspace,
+        serialized: Option<&SerializedOutlinePanel>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
@@ -769,10 +773,12 @@ impl OutlinePanel {
 
             let mut outline_panel_settings = *OutlinePanelSettings::get_global(cx);
             let mut current_theme = ThemeSettings::get_global(cx).clone();
+            let mut document_symbols_by_buffer = HashMap::default();
             let settings_subscription =
                 cx.observe_global_in::<SettingsStore>(window, move |outline_panel, window, cx| {
                     let new_settings = OutlinePanelSettings::get_global(cx);
                     let new_theme = ThemeSettings::get_global(cx);
+                    let mut outlines_invalidated = false;
                     if &current_theme != new_theme {
                         outline_panel_settings = *new_settings;
                         current_theme = new_theme.clone();
@@ -781,6 +787,7 @@ impl OutlinePanel {
                                 excerpt.invalidate_outlines();
                             }
                         }
+                        outlines_invalidated = true;
                         let update_cached_items = outline_panel.update_non_fs_items(window, cx);
                         if update_cached_items {
                             outline_panel.update_cached_entries(Some(UPDATE_DEBOUNCE), window, cx);
@@ -837,13 +844,50 @@ impl OutlinePanel {
                             cx.notify();
                         }
                     }
+
+                    if !outlines_invalidated {
+                        let new_document_symbols = outline_panel
+                            .excerpts
+                            .keys()
+                            .filter_map(|buffer_id| {
+                                let buffer = outline_panel
+                                    .project
+                                    .read(cx)
+                                    .buffer_for_id(*buffer_id, cx)?;
+                                let buffer = buffer.read(cx);
+                                let doc_symbols = language_settings(
+                                    buffer.language().map(|l| l.name()),
+                                    buffer.file(),
+                                    cx,
+                                )
+                                .document_symbols;
+                                Some((*buffer_id, doc_symbols))
+                            })
+                            .collect();
+                        if new_document_symbols != document_symbols_by_buffer {
+                            document_symbols_by_buffer = new_document_symbols;
+                            for excerpts in outline_panel.excerpts.values_mut() {
+                                for excerpt in excerpts.values_mut() {
+                                    excerpt.invalidate_outlines();
+                                }
+                            }
+                            let update_cached_items = outline_panel.update_non_fs_items(window, cx);
+                            if update_cached_items {
+                                outline_panel.update_cached_entries(
+                                    Some(UPDATE_DEBOUNCE),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    }
                 });
 
             let scroll_handle = UniformListScrollHandle::new();
 
             let mut outline_panel = Self {
                 mode: ItemsDisplayMode::Outline,
-                active: false,
+                active: serialized.and_then(|s| s.active).unwrap_or(false),
                 pinned: false,
                 workspace: workspace_handle,
                 project,
@@ -860,7 +904,6 @@ impl OutlinePanel {
                 unfolded_dirs: HashMap::default(),
                 selected_entry: SelectedEntry::None,
                 context_menu: None,
-                width: None,
                 active_item: None,
                 pending_serialization: Task::ready(None),
                 new_entries_for_fs_update: HashSet::default(),
@@ -907,16 +950,15 @@ impl OutlinePanel {
         else {
             return;
         };
-        let width = self.width;
-        let active = Some(self.active);
+        let active = self.active.then_some(true);
+        let kvp = KeyValueStore::global(cx);
         self.pending_serialization = cx.background_spawn(
             async move {
-                KEY_VALUE_STORE
-                    .write_kvp(
-                        serialization_key,
-                        serde_json::to_string(&SerializedOutlinePanel { width, active })?,
-                    )
-                    .await?;
+                kvp.write_kvp(
+                    serialization_key,
+                    serde_json::to_string(&SerializedOutlinePanel { active })?,
+                )
+                .await?;
                 anyhow::Ok(())
             }
             .log_err(),
@@ -1094,7 +1136,7 @@ impl OutlinePanel {
                             .excerpts_for_buffer(buffer.read(cx).remote_id(), cx)
                     })
                     .and_then(|excerpts| {
-                        let (excerpt_id, excerpt_range) = excerpts.first()?;
+                        let (excerpt_id, _, excerpt_range) = excerpts.first()?;
                         multi_buffer_snapshot
                             .anchor_in_excerpt(*excerpt_id, excerpt_range.context.start)
                     })
@@ -1439,13 +1481,7 @@ impl OutlinePanel {
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .action(
-                    if cfg!(target_os = "macos") {
-                        "Reveal in Finder"
-                    } else if cfg!(target_os = "windows") {
-                        "Reveal in File Explorer"
-                    } else {
-                        "Reveal in File Manager"
-                    },
+                    ui::utils::reveal_in_file_manager_label(false),
                     Box::new(RevealInFileManager),
                 )
                 .action("Open in Terminal", Box::new(OpenInTerminal))
@@ -3413,68 +3449,56 @@ impl OutlinePanel {
             return;
         }
 
-        let syntax_theme = cx.theme().syntax().clone();
         let first_update = Arc::new(AtomicBool::new(true));
-        for (buffer_id, (buffer_snapshot, excerpt_ranges)) in excerpt_fetch_ranges {
-            for (excerpt_id, excerpt_range) in excerpt_ranges {
-                let syntax_theme = syntax_theme.clone();
-                let buffer_snapshot = buffer_snapshot.clone();
-                let first_update = first_update.clone();
-                self.outline_fetch_tasks.insert(
-                    (buffer_id, excerpt_id),
-                    cx.spawn_in(window, async move |outline_panel, cx| {
-                        let buffer_language = buffer_snapshot.language().cloned();
-                        let fetched_outlines = cx
-                            .background_spawn(async move {
-                                let mut outlines = buffer_snapshot.outline_items_containing(
-                                    excerpt_range.context,
-                                    false,
-                                    Some(&syntax_theme),
-                                );
-                                outlines.retain(|outline| {
-                                    buffer_language.is_none()
-                                        || buffer_language.as_ref()
-                                            == buffer_snapshot.language_at(outline.range.start)
-                                });
+        for (buffer_id, (_buffer_snapshot, excerpt_ranges)) in excerpt_fetch_ranges {
+            let outline_task = self.active_editor().map(|editor| {
+                editor.update(cx, |editor, cx| editor.buffer_outline_items(buffer_id, cx))
+            });
 
-                                let outlines_with_children = outlines
-                                    .windows(2)
-                                    .filter_map(|window| {
-                                        let current = &window[0];
-                                        let next = &window[1];
-                                        if next.depth > current.depth {
-                                            Some((current.range.clone(), current.depth))
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect::<HashSet<_>>();
+            let excerpt_ids = excerpt_ranges.keys().copied().collect::<Vec<_>>();
+            let first_update = first_update.clone();
 
-                                (outlines, outlines_with_children)
-                            })
-                            .await;
+            self.outline_fetch_tasks.insert(
+                buffer_id,
+                cx.spawn_in(window, async move |outline_panel, cx| {
+                    let Some(outline_task) = outline_task else {
+                        return;
+                    };
+                    let fetched_outlines = outline_task.await;
+                    let outlines_with_children = fetched_outlines
+                        .windows(2)
+                        .filter_map(|window| {
+                            let current = &window[0];
+                            let next = &window[1];
+                            if next.depth > current.depth {
+                                Some((current.range.clone(), current.depth))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<HashSet<_>>();
 
-                        let (fetched_outlines, outlines_with_children) = fetched_outlines;
+                    outline_panel
+                        .update_in(cx, |outline_panel, window, cx| {
+                            let pending_default_depth =
+                                outline_panel.pending_default_expansion_depth.take();
 
-                        outline_panel
-                            .update_in(cx, |outline_panel, window, cx| {
-                                let pending_default_depth =
-                                    outline_panel.pending_default_expansion_depth.take();
+                            let debounce =
+                                if first_update.fetch_and(false, atomic::Ordering::AcqRel) {
+                                    None
+                                } else {
+                                    Some(UPDATE_DEBOUNCE)
+                                };
 
-                                let debounce =
-                                    if first_update.fetch_and(false, atomic::Ordering::AcqRel) {
-                                        None
-                                    } else {
-                                        Some(UPDATE_DEBOUNCE)
-                                    };
-
+                            for excerpt_id in &excerpt_ids {
                                 if let Some(excerpt) = outline_panel
                                     .excerpts
                                     .entry(buffer_id)
                                     .or_default()
-                                    .get_mut(&excerpt_id)
+                                    .get_mut(excerpt_id)
                                 {
-                                    excerpt.outlines = ExcerptOutlines::Outlines(fetched_outlines);
+                                    excerpt.outlines =
+                                        ExcerptOutlines::Outlines(fetched_outlines.clone());
 
                                     if let Some(default_depth) = pending_default_depth
                                         && let ExcerptOutlines::Outlines(outlines) =
@@ -3494,22 +3518,20 @@ impl OutlinePanel {
                                                 outline_panel.collapsed_entries.insert(
                                                     CollapsedEntry::Outline(
                                                         buffer_id,
-                                                        excerpt_id,
+                                                        *excerpt_id,
                                                         outline.range.clone(),
                                                     ),
                                                 );
                                             });
                                     }
-
-                                    // Even if no outlines to check, we still need to update cached entries
-                                    // to show the outline entries that were just fetched
-                                    outline_panel.update_cached_entries(debounce, window, cx);
                                 }
-                            })
-                            .ok();
-                    }),
-                );
-            }
+                            }
+
+                            outline_panel.update_cached_entries(debounce, window, cx);
+                        })
+                        .ok();
+                }),
+            );
         }
     }
 
@@ -4245,7 +4267,7 @@ impl OutlinePanel {
         let buffer_search_matches = self
             .active_editor()
             .map(|active_editor| {
-                active_editor.update(cx, |editor, cx| editor.get_matches(window, cx))
+                active_editor.update(cx, |editor, cx| editor.get_matches(window, cx).0)
             })
             .unwrap_or_default();
 
@@ -4969,17 +4991,8 @@ impl Panel for OutlinePanel {
         });
     }
 
-    fn size(&self, _: &Window, cx: &App) -> Pixels {
-        self.width
-            .unwrap_or_else(|| OutlinePanelSettings::get_global(cx).default_width)
-    }
-
-    fn set_size(&mut self, size: Option<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        self.width = size;
-        cx.notify();
-        cx.defer_in(window, |this, _, cx| {
-            this.serialize(cx);
-        });
+    fn default_size(&self, _: &Window, cx: &App) -> Pixels {
+        OutlinePanelSettings::get_global(cx).default_width
     }
 
     fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
@@ -5038,7 +5051,7 @@ impl Panel for OutlinePanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        5
+        6
     }
 }
 
@@ -5297,6 +5310,22 @@ fn subscribe_for_editor_events(
                         outline_panel.update_cached_entries(Some(UPDATE_DEBOUNCE), window, cx);
                     }
                 }
+                EditorEvent::OutlineSymbolsChanged => {
+                    for excerpts in outline_panel.excerpts.values_mut() {
+                        for excerpt in excerpts.values_mut() {
+                            excerpt.invalidate_outlines();
+                        }
+                    }
+                    if matches!(
+                        outline_panel.selected_entry(),
+                        Some(PanelEntry::Outline(..)),
+                    ) {
+                        outline_panel.selected_entry.invalidate();
+                    }
+                    if outline_panel.update_non_fs_items(window, cx) {
+                        outline_panel.update_cached_entries(Some(UPDATE_DEBOUNCE), window, cx);
+                    }
+                }
                 EditorEvent::TitleChanged => {
                     outline_panel.update_fs_entries(editor.clone(), debounce, window, cx);
                 }
@@ -5332,8 +5361,8 @@ impl GenerationState {
 #[cfg(test)]
 mod tests {
     use db::indoc;
-    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
-    use language::rust_lang;
+    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext, WindowHandle};
+    use language::{self, FakeLspAdapter, rust_lang};
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use search::{
@@ -5341,8 +5370,9 @@ mod tests {
         project_search::{self, perform_project_search},
     };
     use serde_json::json;
+    use smol::stream::StreamExt as _;
     use util::path;
-    use workspace::{OpenOptions, OpenVisible, ToolbarItemView};
+    use workspace::{MultiWorkspace, OpenOptions, OpenVisible, ToolbarItemView};
 
     use super::*;
 
@@ -5357,33 +5387,29 @@ mod tests {
         populate_with_test_ra_project(&fs, root).await;
         let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
         project.read_with(cx, |project, _| project.languages().add(rust_lang()));
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
         outline_panel.update_in(cx, |outline_panel, window, cx| {
             outline_panel.set_active(true, window, cx)
         });
 
-        workspace
-            .update(cx, |workspace, window, cx| {
-                ProjectSearchView::deploy_search(
-                    workspace,
-                    &workspace::DeploySearch::default(),
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-        let search_view = workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .active_pane()
-                    .read(cx)
-                    .items()
-                    .find_map(|item| item.downcast::<ProjectSearchView>())
-                    .expect("Project search view expected to appear after new search event trigger")
-            })
-            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        let search_view = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<ProjectSearchView>())
+                .expect("Project search view expected to appear after new search event trigger")
+        });
 
         let query = "param_names_for_lifetime_elision_hints";
         perform_project_search(&search_view, query, cx);
@@ -5590,33 +5616,29 @@ mod tests {
         populate_with_test_ra_project(&fs, root).await;
         let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
         project.read_with(cx, |project, _| project.languages().add(rust_lang()));
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
         outline_panel.update_in(cx, |outline_panel, window, cx| {
             outline_panel.set_active(true, window, cx)
         });
 
-        workspace
-            .update(cx, |workspace, window, cx| {
-                ProjectSearchView::deploy_search(
-                    workspace,
-                    &workspace::DeploySearch::default(),
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-        let search_view = workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .active_pane()
-                    .read(cx)
-                    .items()
-                    .find_map(|item| item.downcast::<ProjectSearchView>())
-                    .expect("Project search view expected to appear after new search event trigger")
-            })
-            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        let search_view = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<ProjectSearchView>())
+                .expect("Project search view expected to appear after new search event trigger")
+        });
 
         let query = "param_names_for_lifetime_elision_hints";
         perform_project_search(&search_view, query, cx);
@@ -5727,33 +5749,29 @@ mod tests {
         populate_with_test_ra_project(&fs, root).await;
         let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
         project.read_with(cx, |project, _| project.languages().add(rust_lang()));
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
         outline_panel.update_in(cx, |outline_panel, window, cx| {
             outline_panel.set_active(true, window, cx)
         });
 
-        workspace
-            .update(cx, |workspace, window, cx| {
-                ProjectSearchView::deploy_search(
-                    workspace,
-                    &workspace::DeploySearch::default(),
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-        let search_view = workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .active_pane()
-                    .read(cx)
-                    .items()
-                    .find_map(|item| item.downcast::<ProjectSearchView>())
-                    .expect("Project search view expected to appear after new search event trigger")
-            })
-            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        let search_view = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<ProjectSearchView>())
+                .expect("Project search view expected to appear after new search event trigger")
+        });
 
         let query = "param_names_for_lifetime_elision_hints";
         perform_project_search(&search_view, query, cx);
@@ -5953,15 +5971,15 @@ outline: fn hints_lifetimes_named  <==== selected"
         )
         .await;
         let project = Project::test(fs.clone(), [Path::new(path!("/root/one"))], cx).await;
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
         outline_panel.update_in(cx, |outline_panel, window, cx| {
             outline_panel.set_active(true, window, cx)
         });
 
         let items = workspace
-            .update(cx, |workspace, window, cx| {
+            .update_in(cx, |workspace, window, cx| {
                 workspace.open_paths(
                     vec![PathBuf::from(path!("/root/two"))],
                     OpenOptions {
@@ -5973,7 +5991,6 @@ outline: fn hints_lifetimes_named  <==== selected"
                     cx,
                 )
             })
-            .unwrap()
             .await;
         assert_eq!(items.len(), 1, "Were opening another worktree directory");
         assert!(
@@ -5981,26 +5998,22 @@ outline: fn hints_lifetimes_named  <==== selected"
             "Directory should be opened successfully"
         );
 
-        workspace
-            .update(cx, |workspace, window, cx| {
-                ProjectSearchView::deploy_search(
-                    workspace,
-                    &workspace::DeploySearch::default(),
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-        let search_view = workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .active_pane()
-                    .read(cx)
-                    .items()
-                    .find_map(|item| item.downcast::<ProjectSearchView>())
-                    .expect("Project search view expected to appear after new search event trigger")
-            })
-            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        let search_view = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<ProjectSearchView>())
+                .expect("Project search view expected to appear after new search event trigger")
+        });
 
         let query = "aaa";
         perform_project_search(&search_view, query, cx);
@@ -6138,8 +6151,8 @@ struct OutlineEntryExcerpt {
         .await;
         let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
         project.read_with(cx, |project, _| project.languages().add(rust_lang()));
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
         cx.update(|window, cx| {
             outline_panel.update(cx, |outline_panel, cx| {
@@ -6148,7 +6161,7 @@ struct OutlineEntryExcerpt {
         });
 
         let _editor = workspace
-            .update(cx, |workspace, window, cx| {
+            .update_in(cx, |workspace, window, cx| {
                 workspace.open_abs_path(
                     PathBuf::from(path!("/root/src/lib.rs")),
                     OpenOptions {
@@ -6159,7 +6172,6 @@ struct OutlineEntryExcerpt {
                     cx,
                 )
             })
-            .unwrap()
             .await
             .expect("Failed to open Rust source file")
             .downcast::<Editor>()
@@ -6500,33 +6512,29 @@ outline: struct OutlineEntryExcerpt
         )
         .await;
         let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
         outline_panel.update_in(cx, |outline_panel, window, cx| {
             outline_panel.set_active(true, window, cx)
         });
 
-        workspace
-            .update(cx, |workspace, window, cx| {
-                ProjectSearchView::deploy_search(
-                    workspace,
-                    &workspace::DeploySearch::default(),
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-        let search_view = workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .active_pane()
-                    .read(cx)
-                    .items()
-                    .find_map(|item| item.downcast::<ProjectSearchView>())
-                    .expect("Project search view expected to appear after new search event trigger")
-            })
-            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            ProjectSearchView::deploy_search(
+                workspace,
+                &workspace::DeploySearch::default(),
+                window,
+                cx,
+            )
+        });
+        let search_view = workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<ProjectSearchView>())
+                .expect("Project search view expected to appear after new search event trigger")
+        });
 
         let query = "static";
         perform_project_search(&search_view, query, cx);
@@ -6761,13 +6769,18 @@ outline: struct OutlineEntryExcerpt
     async fn add_outline_panel(
         project: &Entity<Project>,
         cx: &mut TestAppContext,
-    ) -> WindowHandle<Workspace> {
-        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+    ) -> (WindowHandle<MultiWorkspace>, Entity<Workspace>) {
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
 
+        let workspace_weak = workspace.downgrade();
         let outline_panel = window
             .update(cx, |_, window, cx| {
-                cx.spawn_in(window, async |this, cx| {
-                    OutlinePanel::load(this, cx.clone()).await
+                cx.spawn_in(window, async move |_this, cx| {
+                    OutlinePanel::load(workspace_weak, cx.clone()).await
                 })
             })
             .unwrap()
@@ -6775,24 +6788,24 @@ outline: struct OutlineEntryExcerpt
             .expect("Failed to load outline panel");
 
         window
-            .update(cx, |workspace, window, cx| {
-                workspace.add_panel(outline_panel, window, cx);
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.add_panel(outline_panel, window, cx);
+                });
             })
             .unwrap();
-        window
+        (window, workspace)
     }
 
     fn outline_panel(
-        workspace: &WindowHandle<Workspace>,
-        cx: &mut TestAppContext,
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
     ) -> Entity<OutlinePanel> {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .panel::<OutlinePanel>(cx)
-                    .expect("no outline panel")
-            })
-            .unwrap()
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .panel::<OutlinePanel>(cx)
+                .expect("no outline panel")
+        })
     }
 
     fn display_entries(
@@ -7151,8 +7164,8 @@ outline: struct OutlineEntryExcerpt
 
         let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
         project.read_with(cx, |project, _| project.languages().add(rust_lang()));
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
 
         outline_panel.update_in(cx, |outline_panel, window, cx| {
@@ -7160,7 +7173,7 @@ outline: struct OutlineEntryExcerpt
         });
 
         workspace
-            .update(cx, |workspace, window, cx| {
+            .update_in(cx, |workspace, window, cx| {
                 workspace.open_abs_path(
                     PathBuf::from("/test/src/lib.rs"),
                     OpenOptions {
@@ -7171,7 +7184,6 @@ outline: struct OutlineEntryExcerpt
                     cx,
                 )
             })
-            .unwrap()
             .await
             .unwrap();
 
@@ -7407,8 +7419,8 @@ outline: fn main"
         let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
         project.read_with(cx, |project, _| project.languages().add(rust_lang()));
 
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
 
         outline_panel.update_in(cx, |outline_panel, window, cx| {
@@ -7416,7 +7428,7 @@ outline: fn main"
         });
 
         let _editor = workspace
-            .update(cx, |workspace, window, cx| {
+            .update_in(cx, |workspace, window, cx| {
                 workspace.open_abs_path(
                     PathBuf::from("/test/src/main.rs"),
                     OpenOptions {
@@ -7427,7 +7439,6 @@ outline: fn main"
                     cx,
                 )
             })
-            .unwrap()
             .await
             .unwrap();
 
@@ -7621,8 +7632,8 @@ outline: fn main"
 
         let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
         project.read_with(cx, |project, _| project.languages().add(rust_lang()));
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
         let outline_panel = outline_panel(&workspace, cx);
 
         outline_panel.update_in(cx, |outline_panel, window, cx| {
@@ -7630,7 +7641,7 @@ outline: fn main"
         });
 
         workspace
-            .update(cx, |workspace, window, cx| {
+            .update_in(cx, |workspace, window, cx| {
                 workspace.open_abs_path(
                     PathBuf::from("/test/src/lib.rs"),
                     OpenOptions {
@@ -7641,7 +7652,6 @@ outline: fn main"
                     cx,
                 )
             })
-            .unwrap()
             .await
             .unwrap();
 
@@ -7796,11 +7806,11 @@ outline: fn main"
         .await;
 
         let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
-        let workspace = add_outline_panel(&project, cx).await;
-        let cx = &mut VisualTestContext::from_window(*workspace, cx);
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
 
         let editor = workspace
-            .update(cx, |workspace, window, cx| {
+            .update_in(cx, |workspace, window, cx| {
                 workspace.open_abs_path(
                     PathBuf::from("/test/foo.txt"),
                     OpenOptions {
@@ -7811,22 +7821,19 @@ outline: fn main"
                     cx,
                 )
             })
-            .unwrap()
             .await
             .unwrap()
             .downcast::<Editor>()
             .unwrap();
 
-        let search_bar = workspace
-            .update(cx, |_, window, cx| {
-                cx.new(|cx| {
-                    let mut search_bar = BufferSearchBar::new(None, window, cx);
-                    search_bar.set_active_pane_item(Some(&editor), window, cx);
-                    search_bar.show(window, cx);
-                    search_bar
-                })
+        let search_bar = workspace.update_in(cx, |_, window, cx| {
+            cx.new(|cx| {
+                let mut search_bar = BufferSearchBar::new(None, window, cx);
+                search_bar.set_active_pane_item(Some(&editor), window, cx);
+                search_bar.show(window, cx);
+                search_bar
             })
-            .unwrap();
+        });
 
         let outline_panel = outline_panel(&workspace, cx);
 
@@ -7867,6 +7874,219 @@ search: | Field          | Meaning        «  »      |
 search: | Field          | Meaning          «  »    |
 search: | Field          | Meaning            «  »  |
 search: | Field          | Meaning              «  »|"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_outline_panel_lsp_document_symbols(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let root = path!("/root");
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            root,
+            json!({
+                "src": {
+                    "lib.rs": "struct Foo {\n    bar: u32,\n    baz: String,\n}\n",
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new(root)], cx).await;
+        let language_registry = project.read_with(cx, |project, _| {
+            project.languages().add(rust_lang());
+            project.languages().clone()
+        });
+
+        let mut fake_language_servers = language_registry.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                capabilities: lsp::ServerCapabilities {
+                    document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                    ..lsp::ServerCapabilities::default()
+                },
+                initializer: Some(Box::new(|fake_language_server| {
+                    fake_language_server
+                        .set_request_handler::<lsp::request::DocumentSymbolRequest, _, _>(
+                            move |_, _| async move {
+                                #[allow(deprecated)]
+                                Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
+                                    lsp::DocumentSymbol {
+                                        name: "Foo".to_string(),
+                                        detail: None,
+                                        kind: lsp::SymbolKind::STRUCT,
+                                        tags: None,
+                                        deprecated: None,
+                                        range: lsp::Range::new(
+                                            lsp::Position::new(0, 0),
+                                            lsp::Position::new(3, 1),
+                                        ),
+                                        selection_range: lsp::Range::new(
+                                            lsp::Position::new(0, 7),
+                                            lsp::Position::new(0, 10),
+                                        ),
+                                        children: Some(vec![
+                                            lsp::DocumentSymbol {
+                                                name: "bar".to_string(),
+                                                detail: None,
+                                                kind: lsp::SymbolKind::FIELD,
+                                                tags: None,
+                                                deprecated: None,
+                                                range: lsp::Range::new(
+                                                    lsp::Position::new(1, 4),
+                                                    lsp::Position::new(1, 13),
+                                                ),
+                                                selection_range: lsp::Range::new(
+                                                    lsp::Position::new(1, 4),
+                                                    lsp::Position::new(1, 7),
+                                                ),
+                                                children: None,
+                                            },
+                                            lsp::DocumentSymbol {
+                                                name: "lsp_only_field".to_string(),
+                                                detail: None,
+                                                kind: lsp::SymbolKind::FIELD,
+                                                tags: None,
+                                                deprecated: None,
+                                                range: lsp::Range::new(
+                                                    lsp::Position::new(2, 4),
+                                                    lsp::Position::new(2, 15),
+                                                ),
+                                                selection_range: lsp::Range::new(
+                                                    lsp::Position::new(2, 4),
+                                                    lsp::Position::new(2, 7),
+                                                ),
+                                                children: None,
+                                            },
+                                        ]),
+                                    },
+                                ])))
+                            },
+                        );
+                })),
+                ..FakeLspAdapter::default()
+            },
+        );
+
+        let (window, workspace) = add_outline_panel(&project, cx).await;
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let outline_panel = outline_panel(&workspace, cx);
+        cx.update(|window, cx| {
+            outline_panel.update(cx, |outline_panel, cx| {
+                outline_panel.set_active(true, window, cx)
+            });
+        });
+
+        let _editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from(path!("/root/src/lib.rs")),
+                    OpenOptions {
+                        visible: Some(OpenVisible::All),
+                        ..OpenOptions::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("Failed to open Rust source file")
+            .downcast::<Editor>()
+            .expect("Should open an editor for Rust source file");
+        let _fake_language_server = fake_language_servers.next().await.unwrap();
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        // Step 1: tree-sitter outlines by default
+        outline_panel.update(cx, |outline_panel, cx| {
+            assert_eq!(
+                display_entries(
+                    &project,
+                    &snapshot(outline_panel, cx),
+                    &outline_panel.cached_entries,
+                    outline_panel.selected_entry(),
+                    cx,
+                ),
+                indoc!(
+                    "
+outline: struct Foo  <==== selected
+  outline: bar
+  outline: baz"
+                ),
+                "Step 1: tree-sitter outlines should be displayed by default"
+            );
+        });
+
+        // Step 2: Switch to LSP document symbols
+        cx.update(|_, cx| {
+            settings::SettingsStore::update_global(
+                cx,
+                |store: &mut settings::SettingsStore, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.project.all_languages.defaults.document_symbols =
+                            Some(settings::DocumentSymbols::On);
+                    });
+                },
+            );
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        outline_panel.update(cx, |outline_panel, cx| {
+            assert_eq!(
+                display_entries(
+                    &project,
+                    &snapshot(outline_panel, cx),
+                    &outline_panel.cached_entries,
+                    outline_panel.selected_entry(),
+                    cx,
+                ),
+                indoc!(
+                    "
+outline: struct Foo  <==== selected
+  outline: bar
+  outline: lsp_only_field"
+                ),
+                "Step 2: After switching to LSP, should see LSP-provided symbols"
+            );
+        });
+
+        // Step 3: Switch back to tree-sitter
+        cx.update(|_, cx| {
+            settings::SettingsStore::update_global(
+                cx,
+                |store: &mut settings::SettingsStore, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.project.all_languages.defaults.document_symbols =
+                            Some(settings::DocumentSymbols::Off);
+                    });
+                },
+            );
+        });
+        cx.executor()
+            .advance_clock(UPDATE_DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+
+        outline_panel.update(cx, |outline_panel, cx| {
+            assert_eq!(
+                display_entries(
+                    &project,
+                    &snapshot(outline_panel, cx),
+                    &outline_panel.cached_entries,
+                    outline_panel.selected_entry(),
+                    cx,
+                ),
+                indoc!(
+                    "
+outline: struct Foo  <==== selected
+  outline: bar
+  outline: baz"
+                ),
+                "Step 3: tree-sitter outlines should be restored"
             );
         });
     }

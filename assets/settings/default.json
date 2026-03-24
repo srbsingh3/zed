@@ -145,6 +145,10 @@
   "restore_on_file_reopen": true,
   // Whether to automatically close files that have been deleted on disk.
   "close_on_file_delete": false,
+  // Whether toggling a panel (e.g. with its keyboard shortcut) also closes
+  // the panel when it is already focused, instead of just moving focus back
+  // to the editor.
+  "close_panel_on_toggle": false,
   // Relative size of the drop target in the editor that will open dropped file as a split pane (0-0.5)
   // E.g. 0.25 == If you drop onto the top/bottom quarter of the pane a new vertical split will be used
   //              If you drop onto the left/right quarter of the pane a new horizontal split will be used
@@ -291,6 +295,10 @@
   "completion_menu_scrollbar": "never",
   // Whether to align detail text in code completions context menus left or right.
   "completion_detail_alignment": "left",
+  // How to display diffs in the editor.
+  //
+  // Default: split
+  "diff_view_style": "split",
   // Show method signatures in the editor, when inside parentheses.
   "auto_signature_help": false,
   // Whether to show the signature help after completion or a bracket pair inserted.
@@ -353,8 +361,11 @@
   // bracket, brace, single or double quote characters.
   // For example, when you select text and type '(', Zed will surround the text with ().
   "use_auto_surround": true,
-  // Whether indentation should be adjusted based on the context whilst typing.
-  "auto_indent": true,
+  // Controls automatic indentation behavior when typing.
+  // - "syntax_aware": Adjusts indentation based on syntax context (default)
+  // - "preserve_indent": Preserves current line's indentation on new lines
+  // - "none": No automatic indentation
+  "auto_indent": "syntax_aware",
   // Whether indentation of pasted content should be adjusted based on the context.
   "auto_indent_on_paste": true,
   // Controls how the editor handles the autoclosed characters.
@@ -449,12 +460,10 @@
     "show_sign_in": true,
     // Whether to show the menus in the titlebar.
     "show_menus": false,
+    // The layout of window control buttons in the title bar (Linux only).
+    "button_layout": "platform_default",
   },
   "audio": {
-    // Opt into the new audio system.
-    "experimental.rodio_audio": false,
-    // Requires 'rodio_audio: true'
-    //
     // Automatically increase or decrease you microphone's volume. This affects how
     // loud you sound to others.
     //
@@ -463,25 +472,14 @@
     // audio and has auto speaker volume on this will make you very loud
     // compared to other speakers.
     "experimental.auto_microphone_volume": false,
-    // Requires 'rodio_audio: true'
-    //
-    // Automatically increate or decrease the volume of other call members.
-    // This only affects how things sound for you.
-    "experimental.auto_speaker_volume": true,
-    // Requires 'rodio_audio: true'
-    //
-    // Remove background noises. Works great for typing, cars, dogs, AC. Does
-    // not work well on music.
-    "experimental.denoise": true,
-    // Requires 'rodio_audio: true'
-    //
-    // Use audio parameters compatible with the previous versions of
-    // experimental audio and non-experimental audio. When this is false you
-    // will sound strange to anyone not on the latest experimental audio. In
-    // the future we will migrate by setting this to false
-    //
-    // You need to rejoin a call for this setting to apply
-    "experimental.legacy_audio_compatible": true,
+    // Select specific output audio device.
+    // `null` means use system default.
+    // Any unrecognized output device will fall back to system default.
+    "experimental.output_audio_device": null,
+    // Select specific input audio device.
+    // `null` means use system default.
+    // Any unrecognized input device will fall back to system default.
+    "experimental.input_audio_device": null,
   },
   // Scrollbar related settings
   "scrollbar": {
@@ -745,6 +743,9 @@
       // 5. Never show the scrollbar:
       //    "never"
       "show": null,
+      // Whether to allow horizontal scrolling in the project panel.
+      // When false, the view is locked to the leftmost position and long file names are clipped.
+      "horizontal_scroll": true,
     },
     // Which files containing diagnostic errors/warnings to mark in the project panel.
     // This setting can take the following three values:
@@ -779,9 +780,12 @@
     // 3. Show files first, then directories:
     //    "files_first"
     "sort_mode": "directories_first",
+    // Whether to show error and warning count badges next to file names in the project panel.
+    "diagnostic_badges": false,
     // Whether to enable drag-and-drop operations in the project panel.
     "drag_and_drop": true,
-    // Whether to hide the root entry when only one folder is open in the window.
+    // Whether to hide the root entry when only one folder is open in the window;
+    // this also affects how file paths appear in the file finder history.
     "hide_root": false,
     // Whether to hide the hidden entries in the project panel.
     "hide_hidden": false,
@@ -869,6 +873,14 @@
     // Choices: label_color, icon
     // Default: icon
     "status_style": "icon",
+    // Whether to show file icons in the git panel.
+    //
+    // Default: false
+    "file_icons": false,
+    // Whether to show folder icons or chevrons for directories in the git panel.
+    //
+    // Default: true
+    "folder_icons": true,
     // What branch name to use if `init.defaultBranch` is not set
     //
     // Default: main
@@ -885,6 +897,14 @@
     ///
     /// Default: false
     "tree_view": false,
+    // Whether the git panel should open on startup.
+    //
+    // Default: false
+    "starts_open": false,
+    // Whether to show a badge on the git panel icon with the count of uncommitted changes.
+    //
+    // Default: false
+    "show_count_badge": false,
     "scrollbar": {
       // When to show the scrollbar in the git panel.
       //
@@ -892,6 +912,10 @@
       // Default: inherits editor scrollbar settings
       // "show": null
     },
+    // Whether to show the addition/deletion change count next to each file in the Git panel.
+    //
+    // Default: true
+    "diff_stats": true,
   },
   "message_editor": {
     // Whether to automatically replace emoji shortcodes with emoji characters.
@@ -905,6 +929,8 @@
     "dock": "right",
     // Default width of the notification panel.
     "default_width": 380,
+    // Whether to show a badge on the notification panel icon with the count of unread notifications.
+    "show_count_badge": false,
   },
   "agent": {
     // Whether the inline assistant should use streaming tools, when available
@@ -915,8 +941,6 @@
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
     "dock": "right",
-    // Where to dock the agents panel. Can be 'left' or 'right'.
-    "agents_panel_dock": "left",
     // Default width when the agent panel is docked to the left or right.
     "default_width": 640,
     // Default height when the agent panel is docked to the bottom.
@@ -954,20 +978,29 @@
       //   "temperature": 1.0
       // }
     ],
-    // When enabled, the agent can run tool actions without asking for your confirmation.
-    // This setting takes precedence over `always_confirm` patterns and `default_mode` settings,
-    // but `always_deny` patterns still block actions for security.
+    // Permission rules for tool actions.
     //
-    // Note: This setting has no effect on external agents that support permission modes, such as Claude Code.
-    //       You can set `agent_servers.claude.default_mode` to `bypassPermissions` to skip all permission requests.
-    "always_allow_tool_actions": false,
-    // Per-tool permission rules for granular control over tool actions.
-    // This setting only applies to the native Zed agent.
+    // The "default" setting applies when no tool-specific rules match.
+    // For external agents that define their own permission modes,
+    // "deny" and "confirm" still take precedence — the external agent's
+    // permission system is only used when Zed would allow the action.
+    //
+    // Per-tool regex patterns ("tools" below) match against tool input text
+    // (commands, paths, URLs, etc.). For `copy_path` and `move_path`,
+    // patterns are matched independently against each path (source and
+    // destination).
     "tool_permissions": {
-      // Here are some examples of tool-specific permissions.
+      // Global default permission when no tool-specific rules match.
+      // "allow" - Auto-approve without prompting
+      // "deny" - Auto-reject
+      // "confirm" - Always prompt (default)
+      "default": "confirm",
+      // Per-tool permission rules. Regex patterns match against tool input text.
+      // The per-tool "default" also applies to MCP tools.
+      // Each tool can have its own default and regex patterns.
       "tools": {
         // "terminal": {
-        //   "default_mode": "confirm",
+        //   "default": "confirm",
         //   "always_confirm": [
         //     // Destructive git operations
         //     { "pattern": "git\\s+(reset|clean)\\s+--hard" },
@@ -975,7 +1008,7 @@
         //   ],
         // },
         // "edit_file": {
-        //   "default_mode": "confirm",
+        //   "default": "confirm",
         //   "always_deny": [
         //     // Secrets and credentials
         //     { "pattern": "\\.env($|\\.)" },
@@ -987,7 +1020,7 @@
       },
     },
     // When enabled, agent edits will be displayed in single-file editors for review
-    "single_file_review": true,
+    "single_file_review": false,
     // When enabled, show voting thumbs for feedback on agent edits.
     "enable_feedback": true,
     "default_profile": "write",
@@ -1012,9 +1045,10 @@
           "save_file": true,
           "open": true,
           "grep": true,
-          "subagent": true,
+          "spawn_agent": true,
           "terminal": true,
           "thinking": true,
+          "update_plan": true,
           "web_search": true,
         },
       },
@@ -1032,8 +1066,9 @@
           "read_file": true,
           "open": true,
           "grep": true,
-          "subagent": true,
+          "spawn_agent": true,
           "thinking": true,
+          "update_plan": true,
           "web_search": true,
         },
       },
@@ -1043,6 +1078,10 @@
         "tools": {},
       },
     },
+    // Whether to start a new thread in the current local project or in a new Git worktree.
+    //
+    // Default: local_project
+    "new_thread_location": "local_project",
     // Where to show notifications when the agent has either completed
     // its response, or else needs confirmation before it can run a
     // tool action.
@@ -1101,6 +1140,21 @@
   //
   // May require language server restart to properly apply.
   "semantic_tokens": "off",
+
+  // Controls whether folding ranges from language servers are used instead of
+  // tree-sitter and indent-based folding.
+  //
+  // Options:
+  // - "off": Use tree-sitter and indent-based folding (default).
+  // - "on": Use LSP folding wherever possible, falling back to tree-sitter and indent-based folding when no results were returned by the server.
+  "document_folding_ranges": "off",
+
+  // Controls the source of document symbols used for outlines and breadcrumbs.
+  //
+  // Options:
+  // - "off": Use tree-sitter queries to compute document symbols (default).
+  // - "on": Use the language server's `textDocument/documentSymbol` LSP response. When enabled, tree-sitter is not used for document symbols.
+  "document_symbols": "off",
 
   // When to automatically save edited buffers. This setting can
   // take four values.
@@ -1222,8 +1276,6 @@
     //
     // Default: true
     "skip_focus_for_active_in_search": true,
-    // Whether to show the git status in the file finder.
-    "git_status": true,
     // Whether to use gitignored files when searching.
     // Only the file Zed had indexed will be used, not necessary all the gitignored files.
     //
@@ -1232,6 +1284,8 @@
     //   * "indexed": Use only the files Zed had indexed
     //   * "smart": Be smart and search for ignored when called from a gitignored worktree
     "include_ignored": "smart",
+    // Whether to include text channels in file finder results.
+    "include_channels": false,
   },
   // Whether or not to remove any trailing whitespace from lines of a buffer
   // before saving it.
@@ -1442,6 +1496,25 @@
     // Should the name or path be displayed first in the git view.
     // "path_style": "file_name_first" or "file_path_first"
     "path_style": "file_name_first",
+    // Directory where git worktrees are created, relative to the repository
+    // working directory.
+    //
+    // When the resolved directory is outside the project root, the
+    // project's directory name is automatically appended so that
+    // sibling repos don't collide. For example, with the default
+    // "../worktrees" and a project at ~/code/zed, worktrees are
+    // created under ~/code/worktrees/zed/.
+    //
+    // When the resolved directory is inside the project root, no
+    // extra component is added (it's already project-scoped).
+    //
+    // Examples:
+    //   "../worktrees" — ~/code/worktrees/<project>/ (default)
+    //   ".git/zed-worktrees" — <project>/.git/zed-worktrees/
+    //   "my-worktrees" — <project>/my-worktrees/
+    //
+    // Trailing slashes are ignored.
+    "worktree_directory": "../worktrees",
   },
   // The list of custom Git hosting providers.
   "git_hosting_providers": [
@@ -1514,6 +1587,13 @@
     "ollama": {
       "api_url": "http://localhost:11434",
       "model": "qwen2.5-coder:7b-base",
+      "prompt_format": "infer",
+      "max_output_tokens": 64,
+    },
+    "open_ai_compatible_api": {
+      "api_url": "",
+      "model": "",
+      "prompt_format": "infer",
       "max_output_tokens": 64,
     },
     // Whether edit predictions are enabled when editing text threads in the agent panel.
@@ -1756,15 +1836,15 @@
         "(?x)",
         "(?<path>",
         "    (",
-        "        # multi-char path: first char (not opening delimiter or space)",
-        "        [^({\\[<\"'`\\ ]",
-        "        # middle chars: non-space, and colon/paren only if not followed by digit/paren",
-        "        ([^\\ :(]|[:(][^0-9()])*",
+        "        # multi-char path: first char (not opening delimiter, space, or box drawing char)",
+        "        [^({\\[<\"'`\\ \\u2500-\\u257F]",
+        "        # middle chars: non-space, and colon/paren only if not followed by digit/paren/space",
+        "        ([^\\ :(]|[:(][^0-9()\\ ])*",
         "        # last char: not closing delimiter or colon",
         "        [^()}\\]>\"'`.,;:\\ ]",
         "    |",
-        "        # single-char path: not delimiter, punctuation, or space",
-        "        [^(){}\\[\\]<>\"'`.,;:\\ ]",
+        "        # single-char path: not delimiter, punctuation, space, or box drawing char",
+        "        [^(){}\\[\\]<>\"'`.,;:\\ \\u2500-\\u257F]",
         "    )",
         "    # optional line/column suffix (included in path for PathWithPosition::parse_str)",
         "    (:+[0-9]+(:[0-9]+)?|:?\\([0-9]+([,:]?[0-9]+)?\\))?",
@@ -1774,6 +1854,8 @@
     // Timeout for hover and Cmd-click path hyperlink discovery in milliseconds. Specifying a
     // timeout of `0` will disable path hyperlinking in terminal.
     "path_hyperlink_timeout_ms": 1,
+    // Whether to show a badge on the terminal panel icon with the count of open terminals.
+    "show_count_badge": false,
   },
   "code_actions_on_format": {},
   // Settings related to running tasks.
@@ -2056,7 +2138,7 @@
       "language_servers": ["basedpyright", "ruff", "!ty", "!pyrefly", "!pyright", "!pylsp", "..."],
     },
     "Ruby": {
-      "language_servers": ["solargraph", "!ruby-lsp", "!rubocop", "!sorbet", "!steep", "..."],
+      "language_servers": ["solargraph", "!ruby-lsp", "!rubocop", "!sorbet", "!steep", "!kanayago", "..."],
     },
     "Rust": {
       "debuggers": ["CodeLLDB"],
@@ -2067,7 +2149,7 @@
       },
     },
     "Starlark": {
-      "language_servers": ["starpls", "!buck2-lsp", "..."],
+      "language_servers": ["starpls", "!buck2-lsp", "!tilt", "..."],
     },
     "Svelte": {
       "language_servers": ["svelte-language-server", "..."],
@@ -2138,6 +2220,9 @@
       "api_url": "https://api.openai.com/v1",
     },
     "openai_compatible": {},
+    "opencode": {
+      "api_url": "https://opencode.ai/zen",
+    },
     "open_router": {
       "api_url": "https://openrouter.ai/api/v1",
     },
@@ -2152,6 +2237,9 @@
     },
     "vercel": {
       "api_url": "https://api.v0.dev/v1",
+    },
+    "vercel_ai_gateway": {
+      "api_url": "https://ai-gateway.vercel.sh/v1",
     },
     "x_ai": {
       "api_url": "https://api.x.ai/v1",
@@ -2222,6 +2310,11 @@
   "global_lsp_settings": {
     // Whether to show the LSP servers button in the status bar.
     "button": true,
+    // The maximum amount of time to wait for responses from language servers, in seconds.
+    // A value of 0 will result in no timeout being applied.
+    //
+    // Default: 120
+    "request_timeout": 120,
     "notifications": {
       // Timeout in milliseconds for automatically dismissing language server notifications.
       // Set to 0 to disable auto-dismiss.

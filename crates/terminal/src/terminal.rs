@@ -207,11 +207,16 @@ impl TerminalBounds {
     }
 
     pub fn num_lines(&self) -> usize {
-        (self.bounds.size.height / self.line_height).floor() as usize
+        // Tolerance to prevent f32 precision from losing a row:
+        // `N * line_height / line_height` can be N-epsilon, which floor()
+        // would round down, pushing the first line into invisible scrollback.
+        let raw = self.bounds.size.height / self.line_height;
+        raw.next_up().floor() as usize
     }
 
     pub fn num_columns(&self) -> usize {
-        (self.bounds.size.width / self.cell_width).floor() as usize
+        let raw = self.bounds.size.width / self.cell_width;
+        raw.next_up().floor() as usize
     }
 
     pub fn height(&self) -> Pixels {
@@ -415,6 +420,8 @@ impl TerminalBuilder {
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
+            #[cfg(any(test, feature = "test-support"))]
+            input_log: Vec::new(),
         };
 
         Ok(TerminalBuilder {
@@ -646,6 +653,8 @@ impl TerminalBuilder {
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
+                #[cfg(any(test, feature = "test-support"))]
+                input_log: Vec::new(),
             };
 
             if !activation_script.is_empty() && no_task {
@@ -870,6 +879,8 @@ pub struct Terminal {
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
+    #[cfg(any(test, feature = "test-support"))]
+    input_log: Vec<Vec<u8>>,
 }
 
 struct CopyTemplate {
@@ -1451,7 +1462,16 @@ impl Terminal {
             .push_back(InternalEvent::Scroll(AlacScroll::Bottom));
         self.events.push_back(InternalEvent::SetSelection(None));
 
+        let input = input.into();
+        #[cfg(any(test, feature = "test-support"))]
+        self.input_log.push(input.to_vec());
+
         self.write_to_pty(input);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_input_log(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.input_log)
     }
 
     pub fn toggle_vi_mode(&mut self) {
@@ -3347,6 +3367,60 @@ mod tests {
             for _ in 0..20000 {
                 scroll_by(1);
                 scroll_by(-1);
+            }
+        }
+
+        #[test]
+        fn test_num_lines_float_precision() {
+            let line_heights = [
+                20.1f32, 16.7, 18.3, 22.9, 14.1, 15.6, 17.8, 19.4, 21.3, 23.7,
+            ];
+            for &line_height in &line_heights {
+                for n in 1..=100 {
+                    let height = n as f32 * line_height;
+                    let bounds = TerminalBounds::new(
+                        px(line_height),
+                        px(8.0),
+                        Bounds {
+                            origin: Point::default(),
+                            size: Size {
+                                width: px(800.0),
+                                height: px(height),
+                            },
+                        },
+                    );
+                    assert_eq!(
+                        bounds.num_lines(),
+                        n,
+                        "num_lines() should be {n} for height={height}, line_height={line_height}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_num_columns_float_precision() {
+            let cell_widths = [8.1f32, 7.3, 9.7, 6.9, 10.1];
+            for &cell_width in &cell_widths {
+                for n in 1..=200 {
+                    let width = n as f32 * cell_width;
+                    let bounds = TerminalBounds::new(
+                        px(20.0),
+                        px(cell_width),
+                        Bounds {
+                            origin: Point::default(),
+                            size: Size {
+                                width: px(width),
+                                height: px(400.0),
+                            },
+                        },
+                    );
+                    assert_eq!(
+                        bounds.num_columns(),
+                        n,
+                        "num_columns() should be {n} for width={width}, cell_width={cell_width}"
+                    );
+                }
             }
         }
     }

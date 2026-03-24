@@ -28,7 +28,7 @@ use std::{
     sync::OnceLock,
     time::Instant,
 };
-use task::{HideStrategy, RevealStrategy, SpawnInTerminal, TaskId};
+use task::{HideStrategy, RevealStrategy, SaveStrategy, SpawnInTerminal, TaskId};
 use ui::ActiveTheme;
 use util::{
     ResultExt,
@@ -47,6 +47,7 @@ use crate::{
         search::{FindCommand, ReplaceCommand, Replacement},
     },
     object::Object,
+    rewrap::Rewrap,
     state::{Mark, Mode},
     visual::VisualDeleteLine,
 };
@@ -318,7 +319,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         }
     });
     Vim::action(editor, cx, |vim, _: &VisualCommand, window, cx| {
-        let Some(workspace) = vim.workspace(window) else {
+        let Some(workspace) = vim.workspace(window, cx) else {
             return;
         };
         workspace.update(cx, |workspace, cx| {
@@ -327,7 +328,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     });
 
     Vim::action(editor, cx, |vim, _: &ShellCommand, window, cx| {
-        let Some(workspace) = vim.workspace(window) else {
+        let Some(workspace) = vim.workspace(window, cx) else {
             return;
         };
         workspace.update(cx, |workspace, cx| {
@@ -346,7 +347,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     });
 
     Vim::action(editor, cx, |vim, _: &ShellCommand, window, cx| {
-        let Some(workspace) = vim.workspace(window) else {
+        let Some(workspace) = vim.workspace(window, cx) else {
             return;
         };
         workspace.update(cx, |workspace, cx| {
@@ -398,7 +399,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 
                 if action.filename.is_empty() {
                     if whole_buffer {
-                        if let Some(workspace) = vim.workspace(window) {
+                        if let Some(workspace) = vim.workspace(window, cx) {
                             workspace.update(cx, |workspace, cx| {
                                 workspace
                                     .save_active_item(
@@ -472,7 +473,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             return;
         }
         if action.filename.is_empty() {
-            if let Some(workspace) = vim.workspace(window) {
+            if let Some(workspace) = vim.workspace(window, cx) {
                 workspace.update(cx, |workspace, cx| {
                     workspace
                         .save_active_item(
@@ -549,7 +550,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     });
 
     Vim::action(editor, cx, |vim, action: &VimSplit, window, cx| {
-        let Some(workspace) = vim.workspace(window) else {
+        let Some(workspace) = vim.workspace(window, cx) else {
             return;
         };
 
@@ -647,7 +648,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 
     Vim::action(editor, cx, |vim, action: &VimEdit, window, cx| {
         vim.update_editor(cx, |vim, editor, cx| {
-            let Some(workspace) = vim.workspace(window) else {
+            let Some(workspace) = vim.workspace(window, cx) else {
                 return;
             };
             let Some(project) = editor.project().cloned() else {
@@ -814,7 +815,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             }
         };
 
-        let Some(workspace) = vim.workspace(window) else {
+        let Some(workspace) = vim.workspace(window, cx) else {
             return;
         };
         let task = workspace.update(cx, |workspace, cx| {
@@ -855,7 +856,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     });
 
     Vim::action(editor, cx, |vim, _: &CountCommand, window, cx| {
-        let Some(workspace) = vim.workspace(window) else {
+        let Some(workspace) = vim.workspace(window, cx) else {
             return;
         };
         let count = Vim::take_count(cx).unwrap_or(1);
@@ -888,7 +889,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             anyhow::Ok(())
         });
         if let Some(e @ Err(_)) = result {
-            let Some(workspace) = vim.workspace(window) else {
+            let Some(workspace) = vim.workspace(window, cx) else {
                 return;
             };
             workspace.update(cx, |workspace, cx| {
@@ -932,7 +933,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         let range = match result {
             None => return,
             Some(e @ Err(_)) => {
-                let Some(workspace) = vim.workspace(window) else {
+                let Some(workspace) = vim.workspace(window, cx) else {
                     return;
                 };
                 workspace.update(cx, |workspace, cx| {
@@ -1627,12 +1628,12 @@ fn generate_commands(_: &App) -> Vec<VimCommand> {
         VimCommand::new(("cq", "uit"), zed_actions::Quit),
         VimCommand::new(
             ("bd", "elete"),
-            workspace::CloseActiveItem {
+            workspace::CloseItemInAllPanes {
                 save_intent: Some(SaveIntent::Close),
                 close_pinned: false,
             },
         )
-        .bang(workspace::CloseActiveItem {
+        .bang(workspace::CloseItemInAllPanes {
             save_intent: Some(SaveIntent::Skip),
             close_pinned: true,
         }),
@@ -1725,6 +1726,15 @@ fn generate_commands(_: &App) -> Vec<VimCommand> {
         )
         .range(wrap_count),
         VimCommand::new(("j", "oin"), JoinLines).range(select_range),
+        VimCommand::new(("reflow", ""), Rewrap { line_length: None })
+            .range(select_range)
+            .args(|_action, args| {
+                args.parse::<usize>().map_or(None, |length| {
+                    Some(Box::new(Rewrap {
+                        line_length: Some(length),
+                    }))
+                })
+            }),
         VimCommand::new(("fo", "ld"), editor::actions::FoldSelectedRanges).range(act_on_range),
         VimCommand::new(("foldo", "pen"), editor::actions::UnfoldLines)
             .bang(editor::actions::UnfoldRecursive)
@@ -2132,7 +2142,7 @@ impl OnMatchingLines {
         let range = match result {
             None => return,
             Some(e @ Err(_)) => {
-                let Some(workspace) = vim.workspace(window) else {
+                let Some(workspace) = vim.workspace(window, cx) else {
                     return;
                 };
                 workspace.update(cx, |workspace, cx| {
@@ -2149,7 +2159,7 @@ impl OnMatchingLines {
         let mut regexes = match Regex::new(&self.search) {
             Ok(regex) => vec![(regex, !self.invert)],
             e @ Err(_) => {
-                let Some(workspace) = vim.workspace(window) else {
+                let Some(workspace) = vim.workspace(window, cx) else {
                     return;
                 };
                 workspace.update(cx, |workspace, cx| {
@@ -2347,7 +2357,7 @@ impl Vim {
         cx: &mut Context<Vim>,
     ) {
         self.stop_recording(cx);
-        let Some(workspace) = self.workspace(window) else {
+        let Some(workspace) = self.workspace(window, cx) else {
             return;
         };
         let command = self.update_editor(cx, |_, editor, cx| {
@@ -2396,7 +2406,7 @@ impl Vim {
         cx: &mut Context<Vim>,
     ) {
         self.stop_recording(cx);
-        let Some(workspace) = self.workspace(window) else {
+        let Some(workspace) = self.workspace(window, cx) else {
             return;
         };
         let command = self.update_editor(cx, |_, editor, cx| {
@@ -2448,7 +2458,7 @@ impl ShellExec {
     }
 
     pub fn run(&self, vim: &mut Vim, window: &mut Window, cx: &mut Context<Vim>) {
-        let Some(workspace) = vim.workspace(window) else {
+        let Some(workspace) = vim.workspace(window, cx) else {
             return;
         };
 
@@ -2479,6 +2489,7 @@ impl ShellExec {
                     show_summary: false,
                     show_command: false,
                     show_rerun: false,
+                    save: SaveStrategy::default(),
                 };
 
                 let task_status = workspace.spawn_in_terminal(spawn_in_terminal, window, cx);
@@ -3534,6 +3545,90 @@ mod test {
                 quirrel
             "},
             Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reflow(cx: &mut TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        cx.update_editor(|editor, _window, cx| {
+            editor.set_hard_wrap(Some(10), cx);
+        });
+
+        cx.set_state(
+            indoc! {"
+                ˇ0123456789 0123456789
+            "},
+            Mode::Normal,
+        );
+
+        cx.simulate_keystrokes(": reflow");
+        cx.simulate_keystrokes("enter");
+
+        cx.assert_state(
+            indoc! {"
+                0123456789
+                ˇ0123456789
+            "},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+                ˇ0123456789 0123456789
+            "},
+            Mode::VisualLine,
+        );
+
+        cx.simulate_keystrokes("shift-v : reflow");
+        cx.simulate_keystrokes("enter");
+
+        cx.assert_state(
+            indoc! {"
+                0123456789
+                ˇ0123456789
+            "},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+                ˇ0123 4567 0123 4567
+            "},
+            Mode::VisualLine,
+        );
+
+        cx.simulate_keystrokes(": reflow space 7");
+        cx.simulate_keystrokes("enter");
+
+        cx.assert_state(
+            indoc! {"
+                ˇ0123
+                4567
+                0123
+                4567
+            "},
+            Mode::Normal,
+        );
+
+        // Assert that, if `:reflow` is invoked with an invalid argument, it
+        // does not actually have any effect in the buffer's contents.
+        cx.set_state(
+            indoc! {"
+                ˇ0123 4567 0123 4567
+            "},
+            Mode::VisualLine,
+        );
+
+        cx.simulate_keystrokes(": reflow space a");
+        cx.simulate_keystrokes("enter");
+
+        cx.assert_state(
+            indoc! {"
+                ˇ0123 4567 0123 4567
+            "},
+            Mode::VisualLine,
         );
     }
 }

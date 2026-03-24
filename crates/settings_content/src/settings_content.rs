@@ -9,6 +9,7 @@ mod project;
 mod serde_helper;
 mod terminal;
 mod theme;
+mod title_bar;
 mod workspace;
 
 pub use agent::*;
@@ -26,12 +27,44 @@ pub use serde_helper::{
 use settings_json::parse_json_with_comments;
 pub use terminal::*;
 pub use theme::*;
+pub use title_bar::*;
 pub use workspace::*;
 
 use collections::{HashMap, IndexMap};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
+
+/// Defines a settings override struct where each field is
+/// `Option<Box<SettingsContent>>`, along with:
+/// - `OVERRIDE_KEYS`: a `&[&str]` of the field names (the JSON keys)
+/// - `get_by_key(&self, key) -> Option<&SettingsContent>`: accessor by key
+///
+/// The field list is the single source of truth for the override key strings.
+macro_rules! settings_overrides {
+    (
+        $(#[$attr:meta])*
+        pub struct $name:ident { $($field:ident),* $(,)? }
+    ) => {
+        $(#[$attr])*
+        pub struct $name {
+            $(pub $field: Option<Box<SettingsContent>>,)*
+        }
+
+        impl $name {
+            /// The JSON override keys, derived from the field names on this struct.
+            pub const OVERRIDE_KEYS: &[&str] = &[$(stringify!($field)),*];
+
+            /// Look up an override by its JSON key name.
+            pub fn get_by_key(&self, key: &str) -> Option<&SettingsContent> {
+                match key {
+                    $(stringify!($field) => self.$field.as_deref(),)*
+                    _ => None,
+                }
+            }
+        }
+    }
+}
 use std::collections::BTreeSet;
 use std::sync::Arc;
 pub use util::serde::default_true;
@@ -166,11 +199,6 @@ pub struct SettingsContent {
     // Settings related to calls in Zed
     pub calls: Option<CallSettingsContent>,
 
-    /// Whether to disable all AI features in Zed.
-    ///
-    /// Default: false
-    pub disable_ai: Option<SaturatingBool>,
-
     /// Settings for the which-key popup.
     pub which_key: Option<WhichKeySettingsContent>,
 
@@ -217,20 +245,29 @@ impl RootUserSettings for UserSettingsContent {
     }
 }
 
+settings_overrides! {
+    #[with_fallible_options]
+    #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
+    pub struct ReleaseChannelOverrides { dev, nightly, preview, stable }
+}
+
+settings_overrides! {
+    #[with_fallible_options]
+    #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
+    pub struct PlatformOverrides { macos, linux, windows }
+}
+
 #[with_fallible_options]
 #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct UserSettingsContent {
     #[serde(flatten)]
     pub content: Box<SettingsContent>,
 
-    pub dev: Option<Box<SettingsContent>>,
-    pub nightly: Option<Box<SettingsContent>>,
-    pub preview: Option<Box<SettingsContent>>,
-    pub stable: Option<Box<SettingsContent>>,
+    #[serde(flatten)]
+    pub release_channel_overrides: ReleaseChannelOverrides,
 
-    pub macos: Option<Box<SettingsContent>>,
-    pub windows: Option<Box<SettingsContent>>,
-    pub linux: Option<Box<SettingsContent>>,
+    #[serde(flatten)]
+    pub platform_overrides: PlatformOverrides,
 
     #[serde(default)]
     pub profiles: IndexMap<String, SettingsContent>,
@@ -281,54 +318,10 @@ impl strum::VariantNames for BaseKeymapContent {
     ];
 }
 
-#[with_fallible_options]
-#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
-pub struct TitleBarSettingsContent {
-    /// Whether to show the branch icon beside branch switcher in the title bar.
-    ///
-    /// Default: false
-    pub show_branch_icon: Option<bool>,
-    /// Whether to show onboarding banners in the title bar.
-    ///
-    /// Default: true
-    pub show_onboarding_banner: Option<bool>,
-    /// Whether to show user avatar in the title bar.
-    ///
-    /// Default: true
-    pub show_user_picture: Option<bool>,
-    /// Whether to show the branch name button in the titlebar.
-    ///
-    /// Default: true
-    pub show_branch_name: Option<bool>,
-    /// Whether to show the project host and name in the titlebar.
-    ///
-    /// Default: true
-    pub show_project_items: Option<bool>,
-    /// Whether to show the sign in button in the title bar.
-    ///
-    /// Default: true
-    pub show_sign_in: Option<bool>,
-    /// Whether to show the user menu button in the title bar.
-    ///
-    /// Default: true
-    pub show_user_menu: Option<bool>,
-    /// Whether to show the menus in the title bar.
-    ///
-    /// Default: false
-    pub show_menus: Option<bool>,
-}
-
 /// Configuration of audio in Zed.
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct AudioSettingsContent {
-    /// Opt into the new audio system.
-    ///
-    /// You need to rejoin a call for this setting to apply
-    #[serde(rename = "experimental.rodio_audio")]
-    pub rodio_audio: Option<bool>, // default is false
-    /// Requires 'rodio_audio: true'
-    ///
     /// Automatically increase or decrease you microphone's volume. This affects how
     /// loud you sound to others.
     ///
@@ -338,28 +331,46 @@ pub struct AudioSettingsContent {
     /// compared to other speakers.
     #[serde(rename = "experimental.auto_microphone_volume")]
     pub auto_microphone_volume: Option<bool>,
-    /// Requires 'rodio_audio: true'
-    ///
-    /// Automatically increate or decrease the volume of other call members.
-    /// This only affects how things sound for you.
-    #[serde(rename = "experimental.auto_speaker_volume")]
-    pub auto_speaker_volume: Option<bool>,
-    /// Requires 'rodio_audio: true'
-    ///
     /// Remove background noises. Works great for typing, cars, dogs, AC. Does
     /// not work well on music.
-    #[serde(rename = "experimental.denoise")]
-    pub denoise: Option<bool>,
-    /// Requires 'rodio_audio: true'
-    ///
-    /// Use audio parameters compatible with the previous versions of
-    /// experimental audio and non-experimental audio. When this is false you
-    /// will sound strange to anyone not on the latest experimental audio. In
-    /// the future we will migrate by setting this to false
-    ///
-    /// You need to rejoin a call for this setting to apply
-    #[serde(rename = "experimental.legacy_audio_compatible")]
-    pub legacy_audio_compatible: Option<bool>,
+    /// Select specific output audio device.
+    #[serde(rename = "experimental.output_audio_device")]
+    pub output_audio_device: Option<AudioOutputDeviceName>,
+    /// Select specific input audio device.
+    #[serde(rename = "experimental.input_audio_device")]
+    pub input_audio_device: Option<AudioInputDeviceName>,
+}
+
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct AudioOutputDeviceName(pub Option<String>);
+
+impl AsRef<Option<String>> for AudioInputDeviceName {
+    fn as_ref(&self) -> &Option<String> {
+        &self.0
+    }
+}
+
+impl From<Option<String>> for AudioInputDeviceName {
+    fn from(value: Option<String>) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct AudioInputDeviceName(pub Option<String>);
+
+impl AsRef<Option<String>> for AudioOutputDeviceName {
+    fn as_ref(&self) -> &Option<String> {
+        &self.0
+    }
+}
+
+impl From<Option<String>> for AudioOutputDeviceName {
+    fn from(value: Option<String>) -> Self {
+        Self(value)
+    }
 }
 
 /// Control what info is collected by Zed.
@@ -516,6 +527,17 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: icon
     pub status_style: Option<StatusStyle>,
+
+    /// Whether to show file icons in the git panel.
+    ///
+    /// Default: false
+    pub file_icons: Option<bool>,
+
+    /// Whether to show folder icons or chevrons for directories in the git panel.
+    ///
+    /// Default: true
+    pub folder_icons: Option<bool>,
+
     /// How and when the scrollbar should be displayed.
     ///
     /// Default: inherits editor scrollbar settings
@@ -542,6 +564,21 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: false
     pub tree_view: Option<bool>,
+
+    /// Whether to show the addition/deletion change count next to each file in the Git panel.
+    ///
+    /// Default: true
+    pub diff_stats: Option<bool>,
+
+    /// Whether to show a badge on the git panel icon with the count of uncommitted changes.
+    ///
+    /// Default: false
+    pub show_count_badge: Option<bool>,
+
+    /// Whether the git panel should open on startup.
+    ///
+    /// Default: false
+    pub starts_open: Option<bool>,
 }
 
 #[derive(
@@ -589,6 +626,10 @@ pub struct NotificationPanelSettingsContent {
     /// Default: 300
     #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub default_width: Option<f32>,
+    /// Whether to show a badge on the notification panel icon with the count of unread notifications.
+    ///
+    /// Default: false
+    pub show_count_badge: Option<bool>,
 }
 
 #[with_fallible_options]
@@ -634,15 +675,15 @@ pub struct FileFinderSettingsContent {
     ///
     /// Default: true
     pub skip_focus_for_active_in_search: Option<bool>,
-    /// Determines whether to show the git status in the file finder
-    ///
-    /// Default: true
-    pub git_status: Option<bool>,
     /// Whether to use gitignored files when searching.
     /// Only the file Zed had indexed will be used, not necessary all the gitignored files.
     ///
     /// Default: Smart
     pub include_ignored: Option<IncludeIgnoredContent>,
+    /// Whether to include text channels in file finder results.
+    ///
+    /// Default: false
+    pub include_channels: Option<bool>,
 }
 
 #[derive(
@@ -1070,11 +1111,6 @@ pub struct ReplSettingsContent {
     ///
     /// Default: 0
     pub output_max_height_lines: Option<usize>,
-    /// Maximum number of columns of output to display before scaling images.
-    /// Set to 0 to disable output width limits.
-    ///
-    /// Default: 0
-    pub output_max_width_columns: Option<usize>,
 }
 
 /// Settings for configuring the which-key popup behaviour.

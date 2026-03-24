@@ -1,38 +1,53 @@
-pub mod acp;
 mod agent_configuration;
+pub(crate) mod agent_connection_store;
 mod agent_diff;
 mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
+mod branch_names;
 mod buffer_codegen;
 mod completion_provider;
+mod config_options;
 mod context;
 mod context_server_configuration;
+pub(crate) mod conversation_view;
+mod entry_view_state;
+mod external_source_prompt;
 mod favorite_models;
 mod inline_assistant;
 mod inline_prompt_editor;
 mod language_model_selector;
 mod mention_set;
+mod message_editor;
+mod mode_selector;
+mod model_selector;
+mod model_selector_popover;
 mod profile_selector;
 mod slash_command;
 mod slash_command_picker;
 mod terminal_codegen;
 mod terminal_inline_assistant;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod text_thread_editor;
 mod text_thread_history;
+mod thread_history;
+mod thread_history_view;
+pub mod thread_metadata_store;
+pub mod threads_archive_view;
 mod ui;
 
 use std::rc::Rc;
 use std::sync::Arc;
 
-// Another comment
+use agent_client_protocol as acp;
 use agent_settings::{AgentProfileId, AgentSettings};
 use assistant_slash_command::SlashCommandRegistry;
 use client::Client;
 use command_palette_hooks::CommandPaletteFilter;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt as _};
 use fs::Fs;
-use gpui::{Action, App, Context, Entity, SharedString, Window, actions};
+use gpui::{Action, App, Context, Entity, SharedString, UpdateGlobal, Window, actions};
 use language::{
     LanguageRegistry,
     language_settings::{AllLanguageSettings, EditPredictionProvider},
@@ -40,21 +55,32 @@ use language::{
 use language_model::{
     ConfiguredModel, LanguageModelId, LanguageModelProviderId, LanguageModelRegistry,
 };
-use project::DisableAiSettings;
+use project::{AgentId, DisableAiSettings};
 use prompt_store::PromptBuilder;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelSelection, Settings as _, SettingsStore};
+use settings::{DockPosition, DockSide, LanguageModelSelection, Settings as _, SettingsStore};
 use std::any::TypeId;
 use workspace::Workspace;
 
 use crate::agent_configuration::{ConfigureContextServerModal, ManageProfilesModal};
-pub use crate::agent_panel::{AgentPanel, ConcreteAssistantPanelDelegate};
+pub use crate::agent_panel::{
+    AgentPanel, AgentPanelEvent, ConcreteAssistantPanelDelegate, WorktreeCreationStatus,
+};
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
+pub(crate) use conversation_view::ConversationView;
+pub use external_source_prompt::ExternalSourcePrompt;
+pub(crate) use mode_selector::ModeSelector;
+pub(crate) use model_selector::ModelSelector;
+pub(crate) use model_selector_popover::ModelSelectorPopover;
 pub use text_thread_editor::{AgentPanelDelegate, TextThreadEditor};
+pub(crate) use thread_history::ThreadHistory;
+pub(crate) use thread_history_view::*;
 use zed_actions;
+
+pub const DEFAULT_THREAD_TITLE: &str = "New Thread";
 
 actions!(
     agent,
@@ -63,6 +89,8 @@ actions!(
         NewTextThread,
         /// Toggles the menu to create new agent threads.
         ToggleNewThreadMenu,
+        /// Cycles through the options for where new threads start (current project or new worktree).
+        CycleStartThreadIn,
         /// Toggles the navigation menu for switching between threads and views.
         ToggleNavigationMenu,
         /// Toggles the options menu for agent settings and preferences.
@@ -111,6 +139,8 @@ actions!(
         Reject,
         /// Rejects all suggestions or changes.
         RejectAll,
+        /// Undoes the most recent reject operation, restoring the rejected changes.
+        UndoLastReject,
         /// Keeps all suggestions or changes.
         KeepAll,
         /// Allow this operation only this time.
@@ -143,6 +173,12 @@ actions!(
         OpenPermissionDropdown,
         /// Toggles thinking mode for models that support extended thinking.
         ToggleThinkingMode,
+        /// Cycles through available thinking effort levels for the current model.
+        CycleThinkingEffort,
+        /// Toggles the thinking effort selector menu open or closed.
+        ToggleThinkingEffortMenu,
+        /// Toggles fast mode for models that support it.
+        ToggleFastMode,
     ]
 );
 
@@ -172,6 +208,17 @@ pub struct SelectPermissionGranularity {
     pub index: usize,
 }
 
+/// Action to toggle a command pattern checkbox in the permission dropdown.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleCommandPattern {
+    /// The tool call ID for which to toggle the pattern.
+    pub tool_call_id: String,
+    /// The index of the command pattern to toggle.
+    pub pattern_index: usize,
+}
+
 /// Creates a new conversation thread, optionally based on an existing thread.
 #[derive(Default, Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
@@ -184,7 +231,7 @@ pub struct NewThread;
 #[serde(deny_unknown_fields)]
 pub struct NewExternalAgentThread {
     /// Which agent to use for the conversation.
-    agent: Option<ExternalAgent>,
+    agent: Option<Agent>,
 }
 
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
@@ -195,36 +242,67 @@ pub struct NewNativeAgentThreadFromSummary {
 }
 
 // TODO unify this with AgentType
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ExternalAgent {
-    Gemini,
-    ClaudeCode,
-    Codex,
+pub enum Agent {
     NativeAgent,
-    Custom { name: SharedString },
+    Custom {
+        #[serde(rename = "name")]
+        id: AgentId,
+    },
 }
 
-impl ExternalAgent {
+impl Agent {
+    pub fn id(&self) -> AgentId {
+        match self {
+            Self::NativeAgent => agent::ZED_AGENT_ID.clone(),
+            Self::Custom { id } => id.clone(),
+        }
+    }
+
     pub fn server(
         &self,
         fs: Arc<dyn fs::Fs>,
         thread_store: Entity<agent::ThreadStore>,
     ) -> Rc<dyn agent_servers::AgentServer> {
         match self {
-            Self::Gemini => Rc::new(agent_servers::Gemini),
-            Self::ClaudeCode => Rc::new(agent_servers::ClaudeCode),
-            Self::Codex => Rc::new(agent_servers::Codex),
             Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs, thread_store)),
-            Self::Custom { name } => Rc::new(agent_servers::CustomAgentServer::new(name.clone())),
+            Self::Custom { id: name } => {
+                Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
+            }
         }
     }
 }
 
+/// Sets where new threads will run.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action,
+)]
+#[action(namespace = agent)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum StartThreadIn {
+    #[default]
+    LocalProject,
+    NewWorktree,
+}
+
 /// Content to initialize new external agent with.
-pub enum ExternalAgentInitialContent {
-    ThreadSummary(acp_thread::AgentSessionInfo),
-    Text(String),
+pub enum AgentInitialContent {
+    ThreadSummary {
+        session_id: acp::SessionId,
+        title: Option<SharedString>,
+    },
+    ContentBlock {
+        blocks: Vec<agent_client_protocol::ContentBlock>,
+        auto_submit: bool,
+    },
+    FromExternalSource(ExternalSourcePrompt),
+}
+
+impl From<ExternalSourcePrompt> for AgentInitialContent {
+    fn from(prompt: ExternalSourcePrompt) -> Self {
+        Self::FromExternalSource(prompt)
+    }
 }
 
 /// Opens the profile management interface for configuring agent tools and settings.
@@ -280,6 +358,7 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry.clone(), fs.clone(), cx);
     TextThreadEditor::init(cx);
+    thread_metadata_store::init(cx);
 
     register_slash_commands(cx);
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
@@ -301,6 +380,10 @@ pub fn init(
                     .find_map(|item| item.downcast::<AgentRegistryPage>());
 
                 if let Some(existing) = existing {
+                    existing.update(cx, |_, cx| {
+                        project::AgentRegistryStore::global(cx)
+                            .update(cx, |store, cx| store.refresh(cx));
+                    });
                     workspace.activate_item(&existing, true, true, window, cx);
                 } else {
                     let registry_page = AgentRegistryPage::new(workspace, window, cx);
@@ -330,6 +413,31 @@ pub fn init(
 
     cx.on_flags_ready(|_, cx| {
         update_command_palette_filter(cx);
+    })
+    .detach();
+
+    cx.observe_flag::<AgentV2FeatureFlag, _>(|is_enabled, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_default_settings(cx, |defaults| {
+                if is_enabled {
+                    defaults.agent.get_or_insert_default().dock = Some(DockPosition::Left);
+                    defaults.project_panel.get_or_insert_default().dock = Some(DockSide::Right);
+                    defaults.outline_panel.get_or_insert_default().dock = Some(DockSide::Right);
+                    defaults.collaboration_panel.get_or_insert_default().dock =
+                        Some(DockPosition::Right);
+                    defaults.git_panel.get_or_insert_default().dock = Some(DockPosition::Right);
+                    defaults.notification_panel.get_or_insert_default().button = Some(false);
+                } else {
+                    defaults.agent.get_or_insert_default().dock = Some(DockPosition::Right);
+                    defaults.project_panel.get_or_insert_default().dock = Some(DockSide::Left);
+                    defaults.outline_panel.get_or_insert_default().dock = Some(DockSide::Left);
+                    defaults.collaboration_panel.get_or_insert_default().dock =
+                        Some(DockPosition::Left);
+                    defaults.git_panel.get_or_insert_default().dock = Some(DockPosition::Left);
+                    defaults.notification_panel.get_or_insert_default().button = Some(true);
+                }
+            });
+        });
     })
     .detach();
 }
@@ -363,7 +471,6 @@ fn update_command_palette_filter(cx: &mut App) {
             filter.hide_namespace("agents");
             filter.hide_namespace("assistant");
             filter.hide_namespace("copilot");
-            filter.hide_namespace("supermaven");
             filter.hide_namespace("zed_predict_onboarding");
             filter.hide_namespace("edit_prediction");
 
@@ -373,50 +480,45 @@ fn update_command_palette_filter(cx: &mut App) {
             if agent_enabled {
                 filter.show_namespace("agent");
                 filter.show_namespace("agents");
+                filter.show_namespace("assistant");
             } else {
                 filter.hide_namespace("agent");
                 filter.hide_namespace("agents");
+                filter.hide_namespace("assistant");
             }
-
-            filter.show_namespace("assistant");
 
             match edit_prediction_provider {
                 EditPredictionProvider::None => {
                     filter.hide_namespace("edit_prediction");
                     filter.hide_namespace("copilot");
-                    filter.hide_namespace("supermaven");
                     filter.hide_action_types(&edit_prediction_actions);
                 }
                 EditPredictionProvider::Copilot => {
                     filter.show_namespace("edit_prediction");
                     filter.show_namespace("copilot");
-                    filter.hide_namespace("supermaven");
-                    filter.show_action_types(edit_prediction_actions.iter());
-                }
-                EditPredictionProvider::Supermaven => {
-                    filter.show_namespace("edit_prediction");
-                    filter.hide_namespace("copilot");
-                    filter.show_namespace("supermaven");
                     filter.show_action_types(edit_prediction_actions.iter());
                 }
                 EditPredictionProvider::Zed
                 | EditPredictionProvider::Codestral
                 | EditPredictionProvider::Ollama
+                | EditPredictionProvider::OpenAiCompatibleApi
                 | EditPredictionProvider::Sweep
                 | EditPredictionProvider::Mercury
                 | EditPredictionProvider::Experimental(_) => {
                     filter.show_namespace("edit_prediction");
                     filter.hide_namespace("copilot");
-                    filter.hide_namespace("supermaven");
                     filter.show_action_types(edit_prediction_actions.iter());
                 }
             }
 
             filter.show_namespace("zed_predict_onboarding");
             filter.show_action_types(&[TypeId::of::<zed_actions::OpenZedPredictOnboarding>()]);
-            if !agent_v2_enabled {
-                filter.hide_action_types(&[TypeId::of::<zed_actions::agent::ToggleAgentPane>()]);
-            }
+        }
+
+        if agent_v2_enabled {
+            filter.show_namespace("multi_workspace");
+        } else {
+            filter.hide_namespace("multi_workspace");
         }
     });
 }
@@ -516,7 +618,7 @@ mod tests {
     use gpui::{BorrowAppContext, TestAppContext, px};
     use project::DisableAiSettings;
     use settings::{
-        DefaultAgentView, DockPosition, DockSide, NotifyWhenAgentWaiting, Settings, SettingsStore,
+        DefaultAgentView, DockPosition, NotifyWhenAgentWaiting, Settings, SettingsStore,
     };
 
     #[gpui::test]
@@ -535,7 +637,6 @@ mod tests {
             enabled: true,
             button: true,
             dock: DockPosition::Right,
-            agents_panel_dock: DockSide::Left,
             default_width: px(300.),
             default_height: px(600.),
             default_model: None,
@@ -548,7 +649,7 @@ mod tests {
             default_profile: AgentProfileId::default(),
             default_view: DefaultAgentView::Thread,
             profiles: Default::default(),
-            always_allow_tool_actions: false,
+
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
             play_sound_when_agent_done: false,
             single_file_review: false,
@@ -561,6 +662,7 @@ mod tests {
             message_editor_min_lines: 1,
             tool_permissions: Default::default(),
             show_turn_stats: false,
+            new_thread_location: Default::default(),
         };
 
         cx.update(|cx| {
@@ -577,6 +679,10 @@ mod tests {
             assert!(
                 !filter.is_hidden(&NewThread),
                 "NewThread should be visible by default"
+            );
+            assert!(
+                !filter.is_hidden(&text_thread_editor::CopyCode),
+                "CopyCode should be visible when agent is enabled"
             );
         });
 
@@ -596,6 +702,10 @@ mod tests {
             assert!(
                 filter.is_hidden(&NewThread),
                 "NewThread should be hidden when agent is disabled"
+            );
+            assert!(
+                filter.is_hidden(&text_thread_editor::CopyCode),
+                "CopyCode should be hidden when agent is disabled"
             );
         });
 
@@ -643,5 +753,19 @@ mod tests {
                 "EditPrediction should be hidden when provider is None"
             );
         });
+    }
+
+    #[test]
+    fn test_deserialize_external_agent_variants() {
+        assert_eq!(
+            serde_json::from_str::<Agent>(r#""native_agent""#).unwrap(),
+            Agent::NativeAgent,
+        );
+        assert_eq!(
+            serde_json::from_str::<Agent>(r#"{"custom":{"name":"my-agent"}}"#).unwrap(),
+            Agent::Custom {
+                id: "my-agent".into(),
+            },
+        );
     }
 }
